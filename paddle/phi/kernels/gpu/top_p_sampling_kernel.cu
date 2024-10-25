@@ -214,12 +214,12 @@ __device__ __forceinline__ void ThreadGetTopK(Pair<T> topk[],
                                               int dim,
                                               const int tid) {
   if (*beam > 0) {
-    int length = (*beam) < beam_size ? *beam : beam_size;
+    int length = (*beam) < beam_size ? *beam : beam_size;    // 2 < 20 min 2
     if (*firstStep) {
       *firstStep = false;
       GetTopK<T, BlockSize>(topk, src, tid, dim, length);
     } else {
-      for (int k = 0; k < MaxLength; k++) {
+      for (int k = 0; k < MaxLength; k++) {   // 2
         if (k < MaxLength - (*beam)) {
           topk[k] = topk[k + *beam];
         } else {
@@ -459,11 +459,11 @@ __global__ void KeMatrixTopPBeamTopKFt(const T* src,
   const int tid = threadIdx.x;
   const int wid = tid / WARP_SIZE;
   const int lane = tid % WARP_SIZE;
-  const int bid = blockIdx.x;
+  const int bid = blockIdx.x;     // 切 batch_size
   const float threshold_now =
       threshold ? static_cast<float>(threshold[bid]) : 0.f;
 
-  int top_num = TopPBeamTopK;
+  int top_num = TopPBeamTopK;      // 20
   float top_p_num = static_cast<float>(top_ps[bid]);
   int64_t* topk_ids_now = nullptr;
   T* topk_scores_now = nullptr;
@@ -475,8 +475,8 @@ __global__ void KeMatrixTopPBeamTopKFt(const T* src,
   __shared__ Pair<T> shared_max[BlockSize / WARP_SIZE];
   __shared__ Pair<T> beam_max[TopPBeamTopK];
 
-  Pair<T> topk[MaxLength];
-  int beam = MaxLength;
+  Pair<T> topk[MaxLength];    // 2
+  int beam = MaxLength;       // 2
   Pair<T> max;
   bool is_empty = false;
   bool firststep = true;
@@ -503,6 +503,12 @@ __global__ void KeMatrixTopPBeamTopKFt(const T* src,
     BlockReduce<T, MaxLength, BlockSize>(
         shared_max, topk, beam_max, &beam, &top_num, &count, tid, wid, lane);
   }
+
+  // !!!!!
+  // TopPBeamTopK => topk_total
+  // MaxLength => topk_thread
+  // k 其实会小于 TopPBeamTopK
+
   if (tid == 0) {
     count_iter_begin[bid] = count_iter[bid];
     float rand_top_p = GPU(rand_uniform)(states + bid) * top_p_num;
@@ -529,6 +535,8 @@ __global__ void KeMatrixTopPBeamTopKFt(const T* src,
           count_iter_begin[bid] += 1;
           if (val < threshold_now) {
             // don't sample low score token
+
+            // 如果这个选择的太小小于 threshold_now， 则向前找
             int start_id = i == 0 ? 0 : i - 1;
             for (int j = start_id; j >= 0; j--) {
               float val_now = static_cast<float>(beam_max[j].v);
@@ -821,10 +829,8 @@ __global__ void topp_sampling_ft(T* sorted_probs,
   if (tid == 0) {
     stop_shared = 0;
     rand_p = p_t;
-#ifdef DEBUG_TOPP
-    printf("bi: %d, p: %f\n", bid, rand_p);
-#endif
   }
+  // YES!!! 说明在 topk 那边 +1 了
   if (count_iter_begin[bid] == count_iter[bid + 1]) {
     // topk
     return;
@@ -850,17 +856,6 @@ __global__ void topp_sampling_ft(T* sorted_probs,
   __syncthreads();
 
   int offset = bid * vocab_size;
-#ifdef DEBUG_TOPP
-  if (tid == 0) {
-    printf(
-        "first_elem1_1: %f, first_elem1_2: %f, first_id1_1: %d, first_id1_2: "
-        "%d\n",
-        static_cast<float>(sorted_probs[offset]),
-        static_cast<float>(sorted_probs[offset + 1]),
-        static_cast<int>(sorted_id[offset]),
-        static_cast<int>(sorted_id[offset + 1]));
-  }
-#endif
   int end = ((vocab_size + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
   int i_activate = 0;
   float thread_offset = 0;
@@ -896,26 +891,9 @@ __global__ void topp_sampling_ft(T* sorted_probs,
     if (tid == 0) {
       out_id[bid] = sorted_id[offset];
       out_val[bid] = sorted_probs[offset];
-#ifdef DEBUG_TOPP
-      printf("stop_shared: %d, out_id: %d, out_val: %f\n",
-             static_cast<int>(stop_shared),
-             static_cast<int>(out_id[bid]),
-             static_cast<float>(out_val[bid]));
-#endif
     }
     return;
   }
-#ifdef DEBUG_TOPP
-  if (tid == 0) {
-    printf(
-        "first_elem2_1: %f, first_elem2_2: %f, first_id2_1: %d, first_id2_2: "
-        "%d\n",
-        static_cast<float>(sorted_probs[offset]),
-        static_cast<float>(sorted_probs[offset + 1]),
-        static_cast<int>(sorted_id[offset]),
-        static_cast<int>(sorted_id[offset + 1]));
-  }
-#endif
   bool skip = (selected_shared[warp_id] > 0) ? false : true;
   for (int i = 0; i < warp_id; i++) {
     if (selected_shared[i] != 0) {
@@ -933,15 +911,6 @@ __global__ void topp_sampling_ft(T* sorted_probs,
 #endif
     if (lane_id == active_lane_id) {
       float val = static_cast<float>(sorted_probs[offset + i_activate]);
-#ifdef DEBUG_TOPP
-      printf(
-          "active_lane_id: %d, i_activate: %d.\n", active_lane_id, i_activate);
-      for (int i = 0; i < active_lane_id; i++) {
-        printf("p %d, value: %f\n",
-               i,
-               static_cast<float>(sorted_probs[offset + i]));
-      }
-#endif
       if (val < threshold_now) {
         // don't sample low score token
         int max_id =
@@ -981,6 +950,7 @@ void DispatchTopPSampling(const Context& dev_ctx,
                           int* count_iter,
                           int* count_iter_begin,
                           const std::string& mode) {
+  // 两块一起处理
   int BlockSize = GetBlockSize(vocab_size);
   if (mode == "truncated") {
     switch (BlockSize) {
@@ -1062,19 +1032,23 @@ T* SafeGetTensorPtr(const paddle::optional<DenseTensor>& t) {
   return t ? SafeGetTensorPtr<T>(t.get()) : nullptr;
 }
 
+
+
 template <typename T, typename Context>
-void TopPSamplingKernel(const Context& dev_ctx,
-                        const DenseTensor& x,
-                        const DenseTensor& ps,
-                        const paddle::optional<DenseTensor>& threshold,
-                        const paddle::optional<DenseTensor>& topp_seed,
-                        int seed,
-                        int k,
-                        const std::string& mode,
-                        DenseTensor* out,
-                        DenseTensor* ids,
-                        DenseTensor* topk_scores,
-                        DenseTensor* topk_ids) {
+void TopPSamplingKernel(
+  const Context& dev_ctx,                           // CUDA 流设置相关
+  const DenseTensor& x,                             // input is probs
+  const DenseTensor& ps,                            // 用于指定每个查询对应的 top_p
+  const paddle::optional<DenseTensor>& threshold,   // 用于避免抽样低分数标记
+  const paddle::optional<DenseTensor>& topp_seed,   
+  int seed,
+  int k,                                            // topk 的 k
+  const std::string& mode,
+  DenseTensor* out,                                 // 选取的 next_tokens scores
+  DenseTensor* ids,                                 // 选取的 next_tokens id
+  DenseTensor* topk_scores,                         // topk 选取输出的 scores
+  DenseTensor* topk_ids                             // topk 选取输出的 ids
+){
   typedef DataTypeTraits<T> traits_;
   typedef typename traits_::DataType DataType_;
   auto cu_stream = dev_ctx.stream();
@@ -1183,13 +1157,18 @@ void TopPSamplingKernel(const Context& dev_ctx,
 
   size_t temp_storage_bytes = 0;
 
+  // 悟了 !!!!
+  // 给到的数据是连续 => 不用batch 的 probs 是连续的 [batch0, batch1, batch2 .....] 
+  // 这样的意义在与 count_iter_begin 指向 每个 batch 的头序号
+  // segment_offsets_t_begin 偏移量迭代器 控制每个偏移量为 vocab_size
+
   cub::TransformInputIterator<int, SegmentOffsetIter, int*>
       segment_offsets_t_begin(count_iter_begin.data<int>(),
                               SegmentOffsetIter(vocab_size));
 
   cub::TransformInputIterator<int, SegmentOffsetIter, int*>
       segment_offsets_t_end(count_iter.data<int>(),
-                            SegmentOffsetIter(vocab_size));
+                            SegmentOffsetIter(vocab_s ize));
 
   cub::DeviceSegmentedRadixSort::SortPairsDescending(
       nullptr,
@@ -1202,6 +1181,12 @@ void TopPSamplingKernel(const Context& dev_ctx,
       bs,
       segment_offsets_t_begin,
       segment_offsets_t_end + 1,
+      /*
+      segment_offsets_t_begin： 0 1 3 4 5 5 7 7 8 
+      segment_offsets_t_end：   0 1 2 3 4 5 6 7 8
+      segment_offsets_t_end+1： 1 2 3 4 5 6 7 8 9
+      need sort (vocab_size):   1 1 0 0 0 0 0 1 1
+      */
       0,
       sizeof(T) * 8,
       cu_stream);
