@@ -415,9 +415,11 @@ __global__ void KeMatrixTopPBeamTopK(const T* src,
       if (!flag) {
         float val = static_cast<float>(beam_max[i].v);
         sum_prob += val;
+        // 法二
+        // curand_uniform
         float random_ratio =
             exponential_transform(GPU(rand_uniform)(states + bid), 1.0f);
-        float random_val = (val >= threshold_now ? val : 0.f) / random_ratio;
+        float random_val = (val >= threshold_now ? val : 0.f) / random_ratio;   // rondom max_id different
         if (max_val < random_val) {
           max_val = random_val;
           max_id = i;
@@ -803,6 +805,73 @@ __global__ void topp_sampling(T* sorted_probs,
   }
 }
 
+#include <vector>
+#include <random>
+#include <algorithm>
+#include <numeric>
+
+template <typename T>
+void topp_sampling_cpu(
+    const std::vector<T>& sorted_probs,       // 已排序的概率
+    const std::vector<int64_t>& sorted_id,    // 已排序的ID
+    std::vector<T>& out_val,                  // 输出的概率
+    std::vector<int64_t>& out_id,             // 输出的ID
+    const std::vector<T>& top_ps,             // top-p阈值
+    const std::vector<T>& threshold,          // 最低概率阈值
+    const int p_num,                          // 每个序列的概率数量
+    const int vocab_size,                     // 词汇大小
+    const bool need_batch_random) {           // 是否需要随机选择低概率词
+
+    const int batch_size = top_ps.size();
+    out_val.resize(batch_size);
+    out_id.resize(batch_size);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    for (int bid = 0; bid < batch_size; ++bid) {
+        float p_t = static_cast<float>(top_ps[bid]);
+        float threshold_now = threshold.empty() ? 0.0f : static_cast<float>(threshold[bid]);
+
+        int offset = bid * vocab_size;
+        float cumulative_prob = 0.0f;
+        bool selected = false;
+
+        for (int i = 0; i < vocab_size; ++i) {
+            float prob = static_cast<float>(sorted_probs[offset + i]);
+            cumulative_prob += prob;
+
+            // 如果达到了top-p概率阈值或该概率值超过最低阈值
+            if (cumulative_prob >= p_t || prob >= threshold_now) {
+                out_id[bid] = sorted_id[offset + i];
+                out_val[bid] = sorted_probs[offset + i];
+                selected = true;
+                break;
+            }
+        }
+
+        // 如果没有选择（即概率值低于阈值），则随机选择一个低概率词
+        if (!selected && need_batch_random) {
+            // 在所有低于`threshold_now`的词汇中选择一个
+            std::vector<int> eligible_indices;
+            for (int i = 0; i < vocab_size; ++i) {
+                if (static_cast<float>(sorted_probs[offset + i]) < threshold_now) {
+                    eligible_indices.push_back(i);
+                }
+            }
+            if (!eligible_indices.empty()) {
+                std::uniform_int_distribution<> dist(0, eligible_indices.size() - 1);
+                int random_idx = eligible_indices[dist(gen)];
+                out_id[bid] = sorted_id[offset + random_idx];
+                out_val[bid] = sorted_probs[offset + random_idx];
+            } else {
+                out_id[bid] = sorted_id[offset];
+                out_val[bid] = sorted_probs[offset];
+            }
+        }
+    }
+}
+
 template <typename T, int BLOCK_SIZE>
 __global__ void topp_sampling_ft(T* sorted_probs,
                                  int64_t* sorted_id,
@@ -810,7 +879,7 @@ __global__ void topp_sampling_ft(T* sorted_probs,
                                  int64_t* out_id,
                                  const T* top_ps,
                                  const T* threshold,
-                                 GPU(randState_t) * states,
+                                 GPU(randState_t) * states,   // 只用于 topk 诶
                                  const int p_num,
                                  const int vocab_size,
                                  const bool need_batch_random,
@@ -840,11 +909,8 @@ __global__ void topp_sampling_ft(T* sorted_probs,
   typedef cub::BlockReduce<int, BLOCK_SIZE> BlockReduce;
   __shared__ typename BlockScan::TempStorage temp_storage;
   __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
-#ifdef PADDLE_WITH_HIP
-  __shared__ uint64_t selected_shared[NUM_WARPS];
-#else
   __shared__ uint32_t selected_shared[NUM_WARPS];
-#endif
+
   int threshold_id = 0;
 
   // Initialize running total
@@ -868,11 +934,7 @@ __global__ void topp_sampling_ft(T* sorted_probs,
     BlockScan(temp_storage)
         .InclusiveSum(thread_count, thread_offset, prefix_op);
 
-#ifdef PADDLE_WITH_HIP
-    uint64_t activate_mask = __ballot(rand_p <= thread_offset);
-#else
     uint32_t activate_mask = __ballot_sync(FINAL_MASK, rand_p <= thread_offset);
-#endif
 
     i_activate = i;
     if (activate_mask != 0) {
@@ -902,28 +964,17 @@ __global__ void topp_sampling_ft(T* sorted_probs,
     }
   }
   if (!skip) {
-#ifdef PADDLE_WITH_HIP
-    int active_lane_id =
-        WARP_SIZE - __popcll(selected_shared[warp_id]);  // first not 0
-#else
     int active_lane_id =
         WARP_SIZE - __popc(selected_shared[warp_id]);  // first not 0
-#endif
     if (lane_id == active_lane_id) {
       float val = static_cast<float>(sorted_probs[offset + i_activate]);
       if (val < threshold_now) {
         // don't sample low score token
         int max_id =
             BlockReduce(temp_storage_reduce).Reduce(threshold_id, MaxOp<int>());
-#ifdef PADDLE_WITH_HIP
-        hiprandStatePhilox4_32_10_t rng;
-        hiprand_init(bid * blockDim.x + tid, tid, 0, &rng);
-        int random_id = hiprand(&rng) % (max_id + 1);
-#else
         curandStatePhilox4_32_10_t rng;
         curand_init(bid * blockDim.x + tid, tid, 0, &rng);
         int random_id = curand(&rng) % (max_id + 1);
-#endif
         out_id[bid] = sorted_id[offset + random_id];
         out_val[bid] = sorted_probs[offset + random_id];
       } else {
@@ -1010,9 +1061,10 @@ __global__ void setup_kernel(GPU(randState_t) * state,
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   for (int i = idx; i < bs; i += gridDim.x * blockDim.x) {
     if (need_batch_random) {
-      GPU(rand_init)(seed, i, offset, &state[i]);
+      curand_init(seed, i, offset, &state[i]);
     } else {
-      GPU(rand_init)(seed, 0, offset, &state[i]);
+      curand_init(seed, 0, offset, &state[i]);
+      // GPU(rand_init)(seed, 0, offset, &state[i]);
     }
   }
 }
@@ -1109,6 +1161,12 @@ void TopPSamplingKernel(
   if (infer_seed) {
     setup_kernel<<<1, 256, 0, cu_stream>>>(states, infer_seed, bs);
   } else {
+    // 生成随机数逻辑
+    // random(int) 即为 seed => float ??? no sure
+    // if -1 
+    // 先按 batch random(int) 及为 seed => 生成 float
+    // if seed
+    // batch all seed => 生成 float
     if (seed_now == -1) {
       need_batch_random = true;
       auto gen_cuda = dev_ctx.GetGenerator();

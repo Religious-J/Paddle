@@ -279,17 +279,17 @@ template <typename T, typename Context>
 void DispatchWithDtype(
     const Context& dev_ctx,
     const DenseTensor& qkv,
-    const DenseTensor& key_cache,
+    const DenseTensor& key_cache,               // cache 用于解码时的注意力机制
     const DenseTensor& value_cache,
-    const DenseTensor& seq_lens_encoder,
-    const DenseTensor& seq_lens_decoder,
+    const DenseTensor& seq_lens_encoder,        // encoder 序列长度向量
+    const DenseTensor& seq_lens_decoder,        // decoder 序列长度向量
     const DenseTensor& seq_lens_this_time,
     const DenseTensor& padding_offsets,
     const DenseTensor& cum_offsets,
     const DenseTensor& cu_seqlens_q,
     const DenseTensor& cu_seqlens_k,
-    const DenseTensor& block_tables,
-    const paddle::optional<DenseTensor>& pre_key_cache,
+    const DenseTensor& block_tables,            // 块索引表
+    const paddle::optional<DenseTensor>& pre_key_cache,   // 之前的缓存数据，用于增量计算和解码器的自回归
     const paddle::optional<DenseTensor>& pre_value_cache,
     const paddle::optional<DenseTensor>& rope_emb,
     const paddle::optional<DenseTensor>& mask,
@@ -315,12 +315,14 @@ void DispatchWithDtype(
     const std::string& compute_dtype,
     const float rope_theta,
     DenseTensor* fmha_out,
-    DenseTensor* qkv_out,
+    DenseTensor* qkv_out,      // qkv_out is probely output relevent 
     DenseTensor* key_cache_out,
     DenseTensor* value_cache_out) {
   phi::DenseTensor qkv_buf;
   phi::DenseTensor fmha_buf;
 
+ // fmha => flash multi-head attention
+ // 分配输出张量的内存
   VLOG(1) << "fmha_out " << fmha_out->dims();
   if (fmha_out->dtype() == phi::DataType::INT8) {
     fmha_buf.Resize(fmha_out->dims());
@@ -335,13 +337,14 @@ void DispatchWithDtype(
     fmha_buf = *fmha_out;
   }
 
+  // 初始化维度参数
   const auto& input_dims = qkv.dims();
   const auto& key_cache_dims = key_cache.dims();
   const int token_num = input_dims[0];
   const int kv_num_head = key_cache_dims[1];
   const int dim_head = key_cache_dims[3];
   const int total_num_head = qkv.dims()[qkv.dims().size() - 1] / dim_head;
-  const int q_num_head = total_num_head - 2 * kv_num_head;
+  const int q_num_head = total_num_head - 2 * kv_num_head;    // mark
   const int bsz = cum_offsets.dims()[0];
   const int max_block_per_seq = block_tables.dims()[1];
   VLOG(3) << "bsz: " << bsz << " token_num: " << token_num
@@ -350,8 +353,9 @@ void DispatchWithDtype(
           << " max_block_per_seq: " << max_block_per_seq;
   VLOG(3) << "fmha_out_dims: " << fmha_out->dims();
 
+ // causual 变量控制是否使用因果注意力机制（Causal Attention），这是自回归模型中的一种约束，用来确保序列中的第 i 个位置只能关注之前的 i-1 个位置
   bool causual = true;
-  if (mask) {
+  if (mask) {          // why ??
     causual = false;
   }
 
@@ -364,8 +368,11 @@ void DispatchWithDtype(
   VLOG(3) << "token_num: " << token_num
           << " pre_cache_length: " << pre_cache_length;
 
+  // [数据处理]
+  // 计算当前解码和编码时的最大长度。如果 max_dec_len_this_time 或 max_enc_len_this_time 为空，函数会通过辅助张量动态计算出序列的最大长度
   int max_dec_len_this_time_data(0);
-  if (!max_dec_len_this_time) {
+  // 计算解码长度
+  if (!max_dec_len_this_time) {          // max_dec_len_this_time 为 flase
     phi::DenseTensor max_dec_len_tensor;
     max_dec_len_tensor.Resize({{1}});
     auto* max_dec_len_data = dev_ctx.template Alloc<int>(
@@ -383,6 +390,7 @@ void DispatchWithDtype(
   }
 
   int max_enc_len_this_time_data(0);
+  // 计算编码长度
   if (!max_enc_len_this_time) {
     phi::DenseTensor max_enc_len_tensor;
     max_enc_len_tensor.Resize({{1}});
@@ -400,8 +408,10 @@ void DispatchWithDtype(
     max_enc_len_this_time_data = *max_enc_len_this_time.get().data<int>();
   }
 
+  // 为解码器配置输出张量的尺寸和内存
   phi::DenseTensor qkv_out_decoder;
   if (max_dec_len_this_time_data > 0) {
+    // yes normal
     if (q_num_head == kv_num_head) {
       qkv_out_decoder.Resize({{bsz, 3, q_num_head, dim_head}});
     } else {
@@ -446,6 +456,8 @@ void DispatchWithDtype(
   VLOG(3) << "encoder";
   VLOG(3) << "max_enc_len_this_time: " << max_enc_len_this_time_data;
 
+  // [量化处理]
+  // 如果 qkv_out_scale 存在，这里会对 qkv 数据进行反量化操作
   if (qkv_out_scale) {
     VLOG(1) << "qkv_out_scale: " << qkv_out_scale.get_ptr()->dims();
     qkv_buf.Resize(qkv.dims());
@@ -469,14 +481,21 @@ void DispatchWithDtype(
     qkv_buf = qkv;
   }
 
+  // 如果存在偏置（qkv_bias），代码会将其添加到 qkv_buf 中
   if (qkv_bias) {
     VLOG(1) << "has bias";
     std::vector<const phi::DenseTensor*> ins = {&qkv_buf, qkv_bias.get_ptr()};
     std::vector<phi::DenseTensor*> outs = {&qkv_buf};
+    // 使用 BroadcastKernel 函数，利用 AddFunctor 对 qkv_buf 和 qkv_bias 的元素进行逐个相加，并将结果写回 qkv_buf
     phi::funcs::BroadcastKernel<T>(
         dev_ctx, ins, &outs, phi::funcs::AddFunctor<T>());
   }
 
+  // -------------------> up all is 对输入数据的处理 
+
+
+  // 位置编码（Rotary Position Embedding）
+  // -------------------> begin - encoder ------------------
   if (max_enc_len_this_time_data > 0) {
     const int* sequence_lengths_data = seq_lens_encoder.data<int>();
     // VLOGMatrix(
@@ -484,6 +503,7 @@ void DispatchWithDtype(
     //     qkv_buf.numel());
     if (rope_emb) {
       if (q_num_head == kv_num_head) {
+        // rotary qk
         rotary_qk_variable(dev_ctx,
                            qkv_buf.data<T>(),
                            qkv_buf.data<T>(),
@@ -517,7 +537,12 @@ void DispatchWithDtype(
     //     qkv_buf.numel());
     VLOG(3) << "rope end";
     VLOG(3) << "causual: " << causual;
+    
+    // 解开填充并进行张量变换
+    // 调用 qkv_transpose_split 函数，将 qkv_buf 中的数据去掉填充项，分割成 unpadding_q、unpadding_k 和 unpadding_v
+    // 输入的 qkv_buf buf?? 中的 从 padding => unpadding 
     if (!use_pre_cache && sm >= 80) {
+      // 解 padding
       qkv_transpose_split<T>(dev_ctx,
                              unpadding_q.data<T>(),
                              unpadding_k.data<T>(),
@@ -548,6 +573,8 @@ void DispatchWithDtype(
       // q,k,v,out all in 3-D [token_num, q_num_head, dim_head].
       auto fmha_shape = fmha_buf.dims();
       fmha_buf.Resize({token_num, q_num_head, dim_head});
+      // encoder
+      // 进行无填充的 Flash 注意力计算
       phi::FlashAttnUnpaddedKernel<T>(dev_ctx,
                                       unpadding_q,
                                       unpadding_k,
@@ -564,6 +591,7 @@ void DispatchWithDtype(
                                       false,
                                       true /* is_test*/,
                                       "" /*rng_name*/,
+                                      // => output
                                       &fmha_buf,
                                       &softmax_out,
                                       &softmax_lse,
@@ -571,7 +599,9 @@ void DispatchWithDtype(
       // Reshape fmha_buf back (to 2-D), to not affect following codes.
       fmha_buf.Resize(fmha_shape);
     } else {
+      // 这边应该和上述的计算类似，只是为性能较差的实现
       if (sm < 80 && !use_pre_cache) {
+        // 代码会调用 MultiHeadAttentionVariableForwardKernel，这是 Paddle 提供的另一种优化的多头自注意力计算内核
         qkv_transpose_split<T>(
             dev_ctx,
             q_trans.data<T>(),
@@ -658,6 +688,7 @@ void DispatchWithDtype(
                                       padding_offsets.data<int>());
     }
 
+    // 代码会调用 MultiHeadAttentionVariableForwardKernel，这是 Paddle 提供的另一种优化的多头自注意力计算内核
     VLOG(3) << "flash end";
     if (cache_k_quant_scales && dynamic_cachekv_quant) {
       DynamicQuantCacheKernel<T>(dev_ctx,
@@ -680,6 +711,7 @@ void DispatchWithDtype(
                                  key_cache_out,
                                  value_cache_out);
     } else {
+      // CacheKernel：否则，使用普通缓存内核，支持量化和去量化的配置，并为 key 和 value 缓存设置对应的量化、去量化缩放因子。???
       CacheKernel<T>(dev_ctx,
                      qkv_buf,
                      block_tables,
@@ -704,14 +736,22 @@ void DispatchWithDtype(
     }
     VLOG(3) << "cache end";
   }
+  // -------------------> end - encoder --------------------
+  
+  
+  
   VLOG(3) << "encoder done";
   VLOG(3) << "max_dec_len_this_time: " << max_dec_len_this_time_data;
+  // 解码器输出和处理
+  // 如果解码器部分有数据处理需求（即 max_dec_len_this_time_data > 0），则对 qkv_buf 进行解码器输出准备
+  // -------------------> begin - decoder ------------------ 
   if (max_dec_len_this_time_data > 0) {
+    // 调用 GetDecoderTensor 提取解码器张量 qkv_out_decoder，并根据缓存量化模式设置 cachekv_quant_mode
     GetDecoderTensor<T>(dev_ctx,
-                        qkv_buf,
+                        qkv_buf,  // mark
                         nullptr,
                         cum_offsets.data<int>(),
-                        &qkv_out_decoder,
+                        &qkv_out_decoder,  // <= out  
                         nullptr,
                         token_num,
                         bsz,
@@ -732,7 +772,10 @@ void DispatchWithDtype(
     //            qkv_out_decoder.numel(),
     //            "qkv_out_decoder",
     //            qkv_out_decoder.numel());
+    // 最终调用 blha 函数执行解码器计算，支持可选的 rope_emb（旋转嵌入）和缓存量化配置，计算结果会保存在 fmha_buf 等变量中
     VLOG(1) << "cachekv_quant_mode " << cachekv_quant_mode;
+
+    // !!!! blha  ==> decoder !!!! 
     blha<T>(dev_ctx,
             qkv_out_decoder,
             nullptr,  // qkv_bias
@@ -772,8 +815,12 @@ void DispatchWithDtype(
             cachekv_quant_mode);
     VLOG(3) << "blha end";
   }
+  // -------------------> end - decoder --------------------
+
   // VLOGMatrix(
   //     fmha_buf.data<T>(), fmha_buf.numel(), "fmha_buf", fmha_buf.numel());
+
+  // 应该又是量化相关的
   if (out_scale > 0) {
     int m = fmha_out->dims()[0];
     int n = fmha_out->dims()[1];
@@ -823,6 +870,7 @@ void DispatchWithDtype(
   }
 }
 
+// HERE input
 template <typename T, typename Context>
 void BlockMultiheadAttentionKernel(
     const Context& dev_ctx,
@@ -866,6 +914,8 @@ void BlockMultiheadAttentionKernel(
     DenseTensor* qkv_out,
     DenseTensor* key_cache_out,
     DenseTensor* value_cache_out) {
+
+  // INT32 ?? quant? preliminary skip
   if (qkv.dtype() == phi::DataType::INT32) {
     VLOG(1) << "qkv.dtype() int32";
     if (compute_dtype == "fp16") {
@@ -956,8 +1006,11 @@ void BlockMultiheadAttentionKernel(
                                                        value_cache_out);
 #endif
     }
-  } else {
+  } 
+  // HERE ??
+  else {
     VLOG(1) << "qkv.dtype() NOT int32";
+    // float16 -> half
     if (std::is_same<T, phi::dtype::float16>::value) {
       DispatchWithDtype<phi::dtype::float16, Context>(dev_ctx,
                                                       qkv,

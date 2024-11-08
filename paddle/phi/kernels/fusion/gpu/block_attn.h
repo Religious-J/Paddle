@@ -97,6 +97,7 @@ struct Block_AttN_params {
   float rope_theta = 10000.0f;
 };
 
+// here 应该是具体 kernel 的一种实现
 template <typename T,
           int Dh,
           int Dh_MAX,
@@ -184,6 +185,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void block_attention_kernel(
 
   const int block_idx = act_time_step / BLOCK_SIZE;
   const int block_offset = act_time_step % BLOCK_SIZE;
+  // here 有 block_table
   const int physical_block_number = block_table_smem[block_idx];
 
   // cache offset of current token
@@ -251,6 +253,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void block_attention_kernel(
       k = add(k, k_bias);
     }
 
+    // rope 模块
     if (params.rotary_emb_dims != 0) {
       if (!params.neox_rotary_style) {
         apply_rotary_embedding(q,
@@ -322,6 +325,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void block_attention_kernel(
       }
     }
 
+    // dot => qk rao
     qk = dot<Qk_vec, Qk_vec>(q, k);
 
     if (QK_VECS_PER_WARP <= WARP_SIZE) {
@@ -384,6 +388,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void block_attention_kernel(
   K_vec k_vec_zero;
   zero(k_vec_zero);
   // ti is the timestep index
+  // -->
   for (int ti = ko; ti < ti_end; ti += K_PER_ITER) {
     const int physical_block_number = block_table_smem[ti / BLOCK_SIZE];
     const int block_offset = ti % BLOCK_SIZE;
@@ -470,7 +475,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void block_attention_kernel(
 
   float sum = 0.f;
   for (int ti = tid; ti <= act_time_step; ti += THREADS_PER_BLOCK) {
-    float logit = __expf(qk_smem[ti] - qk_max);
+    float logit = __expf(qk_smem[ti] - qk_max);    // logit use ??
     sum += logit;
     qk_smem[ti] = logit;
   }
@@ -1525,6 +1530,7 @@ void dispatch_blha_impl(const Block_AttN_params<T> &params,
                              CacheType::INT8>(
         params, stream, load_func, store_func);
   } else {
+    // possibly this patch
     VLOG(1) << "normal cache";
     dispatch_blha_gqa_kernel<T,
                              Dh,
@@ -1672,6 +1678,7 @@ void blha(const phi::GPUContext &dev_ctx,
     params.cache_k_dequant_scales = cache_k_dequant_scales->data<float>();
     params.cache_v_dequant_scales = cache_v_dequant_scales->data<float>();
   } else {
+    // this 无量化
     VLOG(1) << "blha not quant cachekv";
     params.k_cache = k_cache->data<T>();
     params.v_cache = v_cache->data<T>();
